@@ -17,36 +17,45 @@
 
 package com.digitalpebble.stormcrawler.elasticsearch.metrics;
 
-import static org.elasticsearch.common.xcontent.XContentFactory.jsonBuilder;
-
 import java.util.Collection;
 import java.util.Date;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
 
 import org.apache.commons.lang.StringUtils;
+import org.apache.commons.logging.Log;
+import org.apache.commons.logging.LogFactory;
 import org.apache.storm.metric.api.IMetricsConsumer;
 import org.apache.storm.task.IErrorReporter;
 import org.apache.storm.task.TopologyContext;
-import org.elasticsearch.action.index.IndexRequestBuilder;
-import org.elasticsearch.common.xcontent.XContentBuilder;
+import org.elasticsearch.hadoop.rest.InitializationUtils;
+import org.elasticsearch.hadoop.rest.RestService;
+import org.elasticsearch.hadoop.rest.RestService.PartitionWriter;
+import org.elasticsearch.storm.EsBolt;
+import org.elasticsearch.storm.cfg.StormSettings;
+import org.elasticsearch.storm.serialization.StormTupleBytesConverter;
+import org.elasticsearch.storm.serialization.StormTupleFieldExtractor;
+import org.elasticsearch.storm.serialization.StormValueWriter;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.digitalpebble.stormcrawler.elasticsearch.ElasticSearchConnection;
 import com.digitalpebble.stormcrawler.util.ConfUtils;
 
 public class MetricsConsumer implements IMetricsConsumer {
 
-    private final Logger LOG = LoggerFactory.getLogger(getClass());
+    private transient static Log log = LogFactory.getLog(EsBolt.class);
+    private static final Logger LOG = LoggerFactory.getLogger(EsBolt.class);
+
+    private transient PartitionWriter writer;
 
     private static final String ESBoltType = "metrics";
 
     /** name of the index to use for the metrics (default : metrics) **/
-    private static final String ESMetricsIndexNameParamName = "es."
-            + ESBoltType + ".index.name";
+    private static final String ESMetricsIndexNameParamName = "es." + ESBoltType
+            + ".index.name";
 
     /**
      * name of the document type to use for the metrics (default : datapoint)
@@ -58,20 +67,19 @@ public class MetricsConsumer implements IMetricsConsumer {
      * List of whitelisted metrics. Only store metrics with names that are one
      * of these strings
      **/
-    private static final String ESmetricsWhitelistParamName = "es."
-            + ESBoltType + ".whitelist";
+    private static final String ESmetricsWhitelistParamName = "es." + ESBoltType
+            + ".whitelist";
 
     /**
      * List of blacklisted metrics. Never store metrics with names that are one
      * of these strings
      **/
-    private static final String ESmetricsBlacklistParamName = "es."
-            + ESBoltType + ".blacklist";
+    private static final String ESmetricsBlacklistParamName = "es." + ESBoltType
+            + ".blacklist";
 
     private String indexName;
     private String docType;
 
-    private ElasticSearchConnection connection;
     private String[] whitelist = new String[0];
     private String[] blacklist = new String[0];
 
@@ -89,19 +97,36 @@ public class MetricsConsumer implements IMetricsConsumer {
         setBlacklist(ConfUtils.loadListFromConf(ESmetricsBlacklistParamName,
                 stormConf));
 
-        try {
-            connection = ElasticSearchConnection.getConnection(stormConf,
-                    ESBoltType);
-        } catch (Exception e1) {
-            LOG.error("Can't connect to ElasticSearch", e1);
-            throw new RuntimeException(e1);
-        }
+        StormSettings settings = new StormSettings(stormConf);
+
+        InitializationUtils.setValueWriterIfNotSet(settings,
+                StormValueWriter.class, log);
+        InitializationUtils.setBytesConverterIfNeeded(settings,
+                StormTupleBytesConverter.class, log);
+        InitializationUtils.setFieldExtractorIfNotSet(settings,
+                StormTupleFieldExtractor.class, log);
+
+        int totalTasks = context.getComponentTasks(context.getThisComponentId())
+                .size();
+
+        settings.setResourceWrite(indexName + "/" + docType);
+
+        // TODO set the hosts
+
+        writer = RestService.createWriter(settings, context.getThisTaskIndex(),
+                totalTasks, log);
     }
 
     @Override
     public void cleanup() {
-        if (connection != null)
-            connection.close();
+        if (writer != null) {
+            try {
+                writer.repository.flush();
+            } finally {
+                writer.close();
+                writer = null;
+            }
+        }
     }
 
     @Override
@@ -122,8 +147,8 @@ public class MetricsConsumer implements IMetricsConsumer {
                 while (keyValiter.hasNext()) {
                     Entry entry = keyValiter.next();
                     if (!(entry.getValue() instanceof Number)) {
-                        LOG.error("Found data point value {} of class {}",
-                                name, dataPoint.value.getClass().toString());
+                        LOG.error("Found data point value {} of class {}", name,
+                                dataPoint.value.getClass().toString());
                         continue;
                     }
                     Double value = ((Number) entry.getValue()).doubleValue();
@@ -159,7 +184,7 @@ public class MetricsConsumer implements IMetricsConsumer {
     }
 
     /**
-     * Returns the name of the index that metrics will be written too.
+     * Returns the name of the index that metrics will be written to.
      * 
      * @return elastic index name
      */
@@ -172,24 +197,24 @@ public class MetricsConsumer implements IMetricsConsumer {
         if (shouldSkip(name)) {
             return;
         }
-        try {
-            XContentBuilder builder = jsonBuilder().startObject();
-            builder.field("srcComponentId", taskInfo.srcComponentId);
-            builder.field("srcTaskId", taskInfo.srcTaskId);
-            builder.field("srcWorkerHost", taskInfo.srcWorkerHost);
-            builder.field("srcWorkerPort", taskInfo.srcWorkerPort);
-            builder.field("name", name);
-            builder.field("value", value);
-            builder.field("timestamp", timestamp);
 
-            builder.endObject();
+        // build a simple map and send it to ES
+        Map<String, Object> keyVals = new HashMap<>();
+        keyVals.put("srcComponentId", taskInfo.srcComponentId);
+        keyVals.put("srcTaskId", taskInfo.srcTaskId);
+        keyVals.put("srcWorkerHost", taskInfo.srcWorkerHost);
+        keyVals.put("srcWorkerPort", taskInfo.srcWorkerPort);
+        keyVals.put("name", name);
+        keyVals.put("value", value);
+        keyVals.put("timestamp", timestamp);
 
-            IndexRequestBuilder request = connection.getClient()
-                    .prepareIndex(getIndexName(), docType).setSource(builder);
+        // TODO flush?
 
-            connection.getProcessor().add(request.request());
-        } catch (Exception e) {
-            LOG.error("problem when building request for ES", e);
-        }
+        // TODO detect whether index name has changed and if so
+        // flush, close and recreate the writer.
+        // or use
+        // https://www.elastic.co/guide/en/elasticsearch/hadoop/current/configuration.html#cfg-multi-writes-format
+        writer.repository.writeToIndex(keyVals);
+
     }
 }
