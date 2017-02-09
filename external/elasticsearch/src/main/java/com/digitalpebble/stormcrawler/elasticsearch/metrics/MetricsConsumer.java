@@ -34,11 +34,9 @@ import org.apache.storm.task.TopologyContext;
 import org.elasticsearch.hadoop.rest.InitializationUtils;
 import org.elasticsearch.hadoop.rest.RestService;
 import org.elasticsearch.hadoop.rest.RestService.PartitionWriter;
-import org.elasticsearch.storm.EsBolt;
+import org.elasticsearch.hadoop.serialization.MapFieldExtractor;
+import org.elasticsearch.hadoop.serialization.builder.JdkValueWriter;
 import org.elasticsearch.storm.cfg.StormSettings;
-import org.elasticsearch.storm.serialization.StormTupleBytesConverter;
-import org.elasticsearch.storm.serialization.StormTupleFieldExtractor;
-import org.elasticsearch.storm.serialization.StormValueWriter;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -46,8 +44,8 @@ import com.digitalpebble.stormcrawler.util.ConfUtils;
 
 public class MetricsConsumer implements IMetricsConsumer {
 
-    private transient static Log log = LogFactory.getLog(EsBolt.class);
-    private static final Logger LOG = LoggerFactory.getLogger(EsBolt.class);
+    private transient static Log log = LogFactory.getLog(MetricsConsumer.class);
+    private static final Logger LOG = LoggerFactory.getLogger(MetricsConsumer.class);
 
     private transient PartitionWriter writer;
 
@@ -100,12 +98,14 @@ public class MetricsConsumer implements IMetricsConsumer {
         StormSettings settings = new StormSettings(stormConf);
 
         InitializationUtils.setValueWriterIfNotSet(settings,
-                StormValueWriter.class, log);
-        InitializationUtils.setBytesConverterIfNeeded(settings,
-                StormTupleBytesConverter.class, log);
-        InitializationUtils.setFieldExtractorIfNotSet(settings,
-                StormTupleFieldExtractor.class, log);
+                JdkValueWriter.class, log);
 
+        InitializationUtils.setFieldExtractorIfNotSet(settings,
+                MapFieldExtractor.class, log);
+
+        // InitializationUtils.setBytesConverterIfNeeded(settings,
+        // StormTupleBytesConverter.class, log);
+        
         int totalTasks = context.getComponentTasks(context.getThisComponentId())
                 .size();
 

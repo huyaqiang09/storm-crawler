@@ -19,28 +19,31 @@ package com.digitalpebble.stormcrawler.elasticsearch.bolt;
 
 import static com.digitalpebble.stormcrawler.Constants.StatusStreamName;
 
+import java.util.ArrayList;
 import java.util.BitSet;
 import java.util.HashMap;
-import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
+import org.apache.storm.Config;
 import org.apache.storm.metric.api.MultiCountMetric;
 import org.apache.storm.task.OutputCollector;
 import org.apache.storm.task.TopologyContext;
 import org.apache.storm.tuple.Tuple;
 import org.apache.storm.tuple.Values;
+import org.apache.storm.utils.TupleUtils;
 import org.elasticsearch.hadoop.EsHadoopException;
+import org.elasticsearch.hadoop.cfg.ConfigurationOptions;
 import org.elasticsearch.hadoop.rest.InitializationUtils;
 import org.elasticsearch.hadoop.rest.RestService;
 import org.elasticsearch.hadoop.rest.RestService.PartitionWriter;
+import org.elasticsearch.hadoop.serialization.MapFieldExtractor;
+import org.elasticsearch.hadoop.serialization.builder.JdkValueWriter;
+import org.elasticsearch.hadoop.util.unit.TimeValue;
 import org.elasticsearch.storm.cfg.StormSettings;
-import org.elasticsearch.storm.serialization.StormTupleBytesConverter;
-import org.elasticsearch.storm.serialization.StormTupleFieldExtractor;
-import org.elasticsearch.storm.serialization.StormValueWriter;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -63,6 +66,8 @@ public class IndexerBolt extends AbstractIndexerBolt {
             + ".index.name";
     private static final String ESDocTypeParamName = "es." + ESBoltType
             + ".doc.type";
+    private static final String ESFlushInterParamName = "es." + ESBoltType
+            + ".flushInterval";
 
     private OutputCollector _collector;
 
@@ -74,7 +79,12 @@ public class IndexerBolt extends AbstractIndexerBolt {
     private transient PartitionWriter writer;
 
     private transient List<Tuple> inflightTuples = null;
-    private transient OutputCollector collector;
+
+    private transient TimeValue flushInterval;
+
+    private int numberOfEntries;
+
+    private long timeSinceLastFlush = 0;
 
     @SuppressWarnings({ "unchecked", "rawtypes" })
     @Override
@@ -91,22 +101,36 @@ public class IndexerBolt extends AbstractIndexerBolt {
         this.eventCounter = context.registerMetric("ElasticSearchIndexer",
                 new MultiCountMetric(), 10);
 
-        this.collector = collector;
+        String flushIntervalString = ConfUtils.getString(conf,
+                ESFlushInterParamName, "5s");
+
+        flushInterval = TimeValue.parseTimeValue(flushIntervalString);
 
         LinkedHashMap copy = new LinkedHashMap(conf);
         copy.putAll(conf);
 
         StormSettings settings = new StormSettings(copy);
 
+        // align Bolt / es-hadoop batch settings
+        numberOfEntries = ConfUtils.getInt(conf,
+                "es." + ESBoltType + ".bulkActions", 50);
+
+        settings.setProperty(ConfigurationOptions.ES_BATCH_SIZE_ENTRIES,
+                String.valueOf(numberOfEntries));
+
+        inflightTuples = new ArrayList<Tuple>(numberOfEntries + 1);
+
         int totalTasks = context.getComponentTasks(context.getThisComponentId())
                 .size();
 
         InitializationUtils.setValueWriterIfNotSet(settings,
-                StormValueWriter.class, log);
-        InitializationUtils.setBytesConverterIfNeeded(settings,
-                StormTupleBytesConverter.class, log);
+                JdkValueWriter.class, log);
+
         InitializationUtils.setFieldExtractorIfNotSet(settings,
-                StormTupleFieldExtractor.class, log);
+                MapFieldExtractor.class, log);
+
+        // InitializationUtils.setBytesConverterIfNeeded(settings,
+        // StormTupleBytesConverter.class, log);
 
         settings.setResourceWrite(indexName + "/" + docType);
 
@@ -124,7 +148,7 @@ public class IndexerBolt extends AbstractIndexerBolt {
         } catch (EsHadoopException ex) {
             // fail all recorded tuples
             for (Tuple input : inflightTuples) {
-                collector.fail(input);
+                _collector.fail(input);
             }
             inflightTuples.clear();
             throw ex;
@@ -135,14 +159,16 @@ public class IndexerBolt extends AbstractIndexerBolt {
             // bit set means the entry hasn't been removed and thus wasn't
             // written to ES
             if (flush.get(index)) {
-                collector.fail(tuple);
+                _collector.fail(tuple);
             } else {
-                collector.ack(tuple);
+                _collector.ack(tuple);
             }
         }
 
         // clear everything in bulk to prevent 'noisy' remove()
         inflightTuples.clear();
+
+        timeSinceLastFlush = System.currentTimeMillis();
     }
 
     @Override
@@ -159,6 +185,22 @@ public class IndexerBolt extends AbstractIndexerBolt {
 
     @Override
     public void execute(Tuple tuple) {
+
+        // set it to the first tuple received
+        if (timeSinceLastFlush == 0) {
+            timeSinceLastFlush = System.currentTimeMillis();
+        }
+
+        // do we need flushing?
+        if (System.currentTimeMillis() - timeSinceLastFlush > flushInterval
+                .getMillis()) {
+            flush();
+        }
+
+        if (TupleUtils.isTick(tuple)) {
+            _collector.ack(tuple);
+            return;
+        }
 
         String url = tuple.getStringByField("url");
 
@@ -193,27 +235,34 @@ public class IndexerBolt extends AbstractIndexerBolt {
         }
 
         // which metadata to display?
-        Map<String, String[]> keyVals = filterMetadata(metadata);
-
-        Iterator<String> iterator = keyVals.keySet().iterator();
-        while (iterator.hasNext()) {
-            String fieldName = iterator.next();
-            String[] values = keyVals.get(fieldName);
-            builder.put(fieldName, values);
-        }
+        builder.putAll(filterMetadata(metadata));
 
         String sha256hex = org.apache.commons.codec.digest.DigestUtils
                 .sha256Hex(normalisedurl);
 
+        // declare it as id but do not store it?
         builder.put("sha256", sha256hex);
 
-        writer.repository.writeToIndex(keyVals);
+        inflightTuples.add(tuple);
+
+        writer.repository.writeToIndex(builder);
 
         eventCounter.scope("Indexed").incrBy(1);
 
         _collector.emit(StatusStreamName, tuple,
                 new Values(url, metadata, Status.FETCHED));
-        _collector.ack(tuple);
+
+        if (numberOfEntries > 0 && inflightTuples.size() >= numberOfEntries) {
+            flush();
+        }
+    }
+
+    @Override
+    public Map<String, Object> getComponentConfiguration() {
+        // configure how often a tick tuple will be sent to our bolt
+        Config conf = new Config();
+        conf.put(Config.TOPOLOGY_TICK_TUPLE_FREQ_SECS, 1);
+        return conf;
     }
 
 }
