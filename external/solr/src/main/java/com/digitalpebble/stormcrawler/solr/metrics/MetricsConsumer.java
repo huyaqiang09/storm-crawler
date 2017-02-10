@@ -39,11 +39,9 @@ public class MetricsConsumer implements IMetricsConsumer {
 
     private static final String BOLT_TYPE = "metrics";
 
-    private static final String SolrIndexCollection = "solr.metrics.collection";
     private static final String SolrTTLParamName = "solr.metrics.ttl";
     private static final String SolrTTLFieldParamName = "solr.metrics.ttl.field";
 
-    private String collection;
     private String ttlField;
     private String ttl;
 
@@ -53,8 +51,6 @@ public class MetricsConsumer implements IMetricsConsumer {
     public void prepare(Map stormConf, Object registrationArgument,
             TopologyContext topologyContext, IErrorReporter errorReporter) {
 
-        collection = ConfUtils.getString(stormConf, SolrIndexCollection,
-                "metrics");
         ttlField = ConfUtils.getString(stormConf, SolrTTLFieldParamName,
                 "__ttl__");
         ttl = ConfUtils.getString(stormConf, SolrTTLParamName, null);

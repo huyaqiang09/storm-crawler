@@ -1,5 +1,5 @@
 # Solr indexer bolt
-solr.indexer.url: "http://localhost:8983/solr/collection1"
+solr.indexer.url: "http://localhost:8983/solr/docs"
 
 # Solr spout and persistence bolt
 solr.status.url: "http://localhost:8983/solr/status"
@@ -15,6 +15,6 @@ solr.metrics.ttl.field: 'timestamp'
 # For SolrCloud, use this settings instead of solr.indexer.url
 #
 #   solr.indexer.zkhost: "http://localhost:9983/"
-#   solr.indexer.collection: collection1
+#   solr.indexer.collection: docs
 #
 # the same applies for the spout/persistence bolt and the metricsconsumer
